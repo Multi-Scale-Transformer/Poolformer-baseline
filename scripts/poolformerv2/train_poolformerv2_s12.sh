@@ -1,5 +1,5 @@
-DATA_PATH=/path/to/imagenet
-CODE_PATH=/path/to/code/metaformer # modify code path here
+DATA_PATH=/root/SharedData/datasets/ImageNet1k
+CODE_PATH=/root/workspace/metaformer # modify code path here
 
 
 ALL_BATCH_SIZE=4096
