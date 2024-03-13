@@ -132,6 +132,8 @@ default_cfgs = {
         num_classes=21841),
 
 
+    'aformer_s18': _cfg(
+        url='https://huggingface.co/sail/dl/resolve/main/caformer/caformer_s18.pth'),
     'caformer_s18': _cfg(
         url='https://huggingface.co/sail/dl/resolve/main/caformer/caformer_s18.pth'),
     'caformer_s18_384': _cfg(
@@ -656,6 +658,145 @@ class MetaFormer(nn.Module):
         return x
 
 
+class Attention_qkv(nn.Module):
+    """
+    Vanilla self-attention from Transformer: https://arxiv.org/abs/1706.03762.
+    Modified to use scaled_dot_product_attention for efficiency.
+    """
+    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
+                 attn_drop=0., proj_drop=0., proj_bias=False, **kwargs):
+        super().__init__()
+
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+
+        self.num_heads = num_heads if num_heads else dim // head_dim
+        if self.num_heads == 0:
+            self.num_heads = 1
+        
+        self.attention_dim = self.num_heads * self.head_dim
+
+        self.q = nn.Linear(dim, self.attention_dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, self.attention_dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, self.attention_dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(self.attention_dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        N = H * W
+        qkv = (self.q(x), self.k(x), self.v(x))
+        qkv = [t.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3) for t in qkv]
+        q, k, v = qkv
+
+        attn_output = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        attn_output = self.attn_drop(attn_output)  # Apply dropout to the attention output
+        attn_output = attn_output.transpose(1, 2).reshape(B, H, W, self.attention_dim)
+        x = self.proj(attn_output)
+        x = self.proj_drop(x)
+        return x
+
+
+
+
+class HardgroupAttention(nn.Module):
+    """
+    Modified Softgroup Attention incorporating elements from MultiHeadAttention in Code B.
+    """
+    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
+        attn_drop=0., proj_drop=0., proj_bias=False, group_mode='multi', gp_num=48, **kwargs):
+        super().__init__()
+
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+        self.group_mode = group_mode
+        
+        self.num_heads = num_heads if num_heads else dim // head_dim
+        if self.num_heads == 0:
+            self.num_heads = 1
+        
+        self.attention_dim = self.num_heads * self.head_dim
+
+        self.qkv = nn.Linear(dim, self.attention_dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(self.attention_dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+        # Group parameter and additional functions
+        self.gp_num = gp_num
+        self.gp = nn.Linear(dim, gp_num, bias=False)
+        self.gp1 = nn.Linear(dim, gp_num, bias=True)
+        self.gp2 = nn.Linear(dim, gp_num, bias=True)
+        self.topk = 5
+        self.gelu = nn.GELU()
+        self.relu = nn.ReLU()
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+
+        N = H * W
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        qkv = [part.reshape(B, N, self.num_heads, -1).transpose(1, 2) for part in qkv]
+
+        q, k, v = qkv
+        attn_weights = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn_weights = F.softmax(attn_weights, dim=-1)
+
+        if self.group_mode == 'multi':
+            gp = self.gp.weight
+            gp1 = self.relu(self.gp1.weight)
+            gp2 = self.relu(self.gp2.weight)
+            gp = torch.einsum('nc,nc,nc->nc', gp, gp1, gp2)
+
+
+            gp = gp.unsqueeze(0).view(self.num_heads, self.gp_num, self.head_dim)
+            group_weight = torch.einsum('bhnd,hmd->bhnm', q, gp)
+            _, idx = torch.topk(group_weight, k=1, dim=-1)
+            group_weight = torch.zeros_like(group_weight)
+            group_weight.scatter_(dim=-1, index=idx, value=1)
+            q_mean = torch.einsum('bhng,bhnd->bhgd', group_weight, q)
+            num_per_group = group_weight.sum(dim=2).unsqueeze(-1)
+            q_mean = q_mean / num_per_group
+            q_mean_weights = torch.einsum('bhgd,bhnd->bhng', q_mean, k)
+            _, idx = torch.topk(q_mean_weights, k=self.topk, dim=-1)
+            q_mean_weights = torch.zeros_like(q_mean_weights)
+            q_mean_weights.scatter_(dim=-1, index=idx, value=1)
+            attn_output = torch.einsum('bhng,bhmG->bhnm', group_weight, q_mean_weights)
+        else:
+            b, h, n, d = q.shape
+            q_all_heads = q.permute(0, 2, 1, 3)
+            q_all_heads = q_all_heads.reshape(b, n, h*d)
+
+            k_all_heads = k.permute(0, 2, 1, 3)
+            k_all_heads = k_all_heads.reshape(b, n, h*d)
+            
+            group_weight = self.gp(q_all_heads) #group_weight shape [2, 3136, 48]
+            _, idx = torch.topk(group_weight, k=1, dim=-1)
+            group_weight = torch.zeros_like(group_weight)
+            group_weight.scatter_(dim=-1, index=idx, value=1)
+            
+            q_mean = torch.matmul(group_weight.transpose(-2, -1), q_all_heads)
+            num_per_group = group_weight.sum(dim=1).unsqueeze(-1)
+            q_mean = q_mean / num_per_group
+            q_mean_weights = torch.matmul(q_mean, k_all_heads.transpose(-1, -2))
+            _, idx = torch.topk(q_mean_weights, k=self.topk, dim=-1)
+            q_mean_weights = torch.zeros_like(q_mean_weights)
+            q_mean_weights.scatter_(dim=-1, index=idx, value=1)
+            
+            
+            
+            attn_output = torch.matmul(group_weight, q_mean_weights)
+
+        attn_weights = attn_weights * attn_output
+        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        attn_weights = self.attn_drop(attn_weights)
+
+        x = torch.matmul(attn_weights, v)
+        x = x.transpose(1, 2).reshape(B, H, W, -1)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
 @register_model
 def identityformer_s12(pretrained=False, **kwargs):
@@ -1534,5 +1675,37 @@ def caformer_b36_in21k(pretrained=False, **kwargs):
     if pretrained:
         state_dict = torch.hub.load_state_dict_from_url(
             url= model.default_cfg['url'], map_location="cpu", check_hash=True)
+        model.load_state_dict(state_dict)
+    return model
+
+@register_model
+def aformer_s18(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3],
+        dims=[64, 128, 320, 512],
+        token_mixers=Attention_qkv,
+        head_fn=MlpHead,
+        **kwargs)
+    model.default_cfg = default_cfgs['caformer_s18']
+    if pretrained:
+        state_dict = torch.hub.load_state_dict_from_url(
+            url=model.default_cfg['url'], map_location="cpu", check_hash=True
+        )
+        model.load_state_dict(state_dict)
+    return model
+
+@register_model
+def hgformer_s18(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3],
+        dims=[64, 128, 320, 512],
+        token_mixers=[SepConv, SepConv, HardgroupAttention, HardgroupAttention],
+        head_fn=MlpHead,
+        **kwargs)
+    model.default_cfg = default_cfgs['caformer_s18']
+    if pretrained:
+        state_dict = torch.hub.load_state_dict_from_url(
+            url=model.default_cfg['url'], map_location="cpu", check_hash=True
+        )
         model.load_state_dict(state_dict)
     return model
