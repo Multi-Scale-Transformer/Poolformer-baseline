@@ -11,4 +11,4 @@ let BATCH_SIZE=ALL_BATCH_SIZE/NUM_GPU/GRAD_ACCUM_STEPS
 cd $CODE_PATH && sh distributed_train.sh $NUM_GPU $DATA_PATH \
 --model poolformerv2_s12 --opt adamw --lr 4e-3 --warmup-epochs 5 \
 -b $BATCH_SIZE --grad-accum-steps $GRAD_ACCUM_STEPS \
---drop-path 0.1
+--drop-path 0.1 \

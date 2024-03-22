@@ -49,21 +49,22 @@ import torch.nn as nn
 import torchvision.utils
 import yaml
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
-
+torch._dynamo.config.optimize_ddp = False
+torch.set_float32_matmul_precision('medium')
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, \
     LabelSmoothingCrossEntropy
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, \
     model_parameters
-from timm.models.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
+from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 # from timm.utils import ApexScaler, NativeScaler
 from utils import ApexScalerAccum as ApexScaler
 from utils import NativeScalerAccum as NativeScaler
 import metaformer_baselines
-
+# torch.autograd.set_detect_anomaly(True)
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -128,6 +129,10 @@ group.add_argument('--pretrained', action='store_true', default=False,
                     help='Start with pretrained version of specified network (if avail)')
 group.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
                     help='Initialize model from this checkpoint (default: none)')
+group.add_argument('--load-checkpoint-unstrict', default=None, type=str, metavar='PATH',
+                    help='Initialize model from this checkpoint (default: none)')
+group.add_argument('--freeze-checkpoint', action='store_true', default=False, 
+                    help='aaa')
 group.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='Resume full model and optimizer state from checkpoint (default: none)')
 group.add_argument('--no-resume-opt', action='store_true', default=False,
@@ -449,6 +454,25 @@ def main():
         create_model_args.update(head_dropout=args.head_dropout)
 
     model = create_model(**create_model_args)
+    
+    
+    # if args.load_checkpoint_unstrict is not None:
+    #     pretrained_weight = torch.load(args.load_checkpoint_unstrict, map_location='cpu')
+
+    #     # 假设 model 和_weight 已经定义好了
+    #     for name, param in model.named_parameters():
+    #         if name in pretrained_weight and param.data.shape == pretrained_weight[name].shape:
+    #             # 更新模型中的参数为预训练权重
+    #             param.data.copy_(pretrained_weight[name])
+    #             if args.freeze_checkpoint:
+    #                 param.requires_grad = False
+    #         else:
+    #             print(f"Skipping {name} as it is not in the weights.")
+
+
+    load_checkpoint(model, args.load_checkpoint_unstrict, strict=False)
+
+    trainable_params = [param for name, param in model.named_parameters() if param.requires_grad]
 
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
@@ -501,8 +525,9 @@ def main():
     if args.aot_autograd:
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
+        
 
-    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
+    optimizer = create_optimizer_v2(trainable_params, **optimizer_kwargs(cfg=args))
 
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
@@ -550,9 +575,9 @@ def main():
         else:
             if args.local_rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
+            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb,
+                              find_unused_parameters=False)
         # NOTE: EMA model does not need to be wrapped by DDP
-
     # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
@@ -747,7 +772,6 @@ def train_one_epoch(
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
         loss_scaler=None, model_ema=None, mixup_fn=None,
         grad_accum_steps=1, num_training_steps_per_epoch=None):
-
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
             loader.mixup_enabled = False
@@ -781,7 +805,12 @@ def train_one_epoch(
 
         with amp_autocast():
             output = model(input)
+            # assert not torch.any(torch.isnan(output) + torch.isinf(output))
+
             loss = loss_fn(output, target)
+            # assert not torch.any(torch.isnan(output) + torch.isinf(output))
+            # assert torch.isnan(loss).sum() == 0, print(loss)
+            
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -802,6 +831,7 @@ def train_one_epoch(
                     utils.dispatch_clip_grad(
                         model_parameters(model, exclude_head='agc' in args.clip_mode),
                         value=args.clip_grad, mode=args.clip_mode)
+
                 optimizer.step()
 
         if update_grad:

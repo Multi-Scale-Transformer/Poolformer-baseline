@@ -21,11 +21,13 @@ from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import sys
+sys.path.append('/root/workspace/metaformer')
 from timm.models.layers import trunc_normal_, DropPath
 from timm.models.registry import register_model
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers.helpers import to_2tuple
+from token_mixer import *
 
 
 def _cfg(url='', **kwargs):
@@ -291,6 +293,44 @@ class Attention(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, H, W, self.attention_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class Attention_v(nn.Module):
+    """
+    Vanilla self-attention from Transformer: https://arxiv.org/abs/1706.03762.
+    Modified from timm.
+    """
+    def __init__(self, dim, head_dim=32, num_heads=None, qkv_bias=False,
+        attn_drop=0., proj_drop=0., proj_bias=False, **kwargs):
+        super().__init__()
+
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+
+        self.num_heads = num_heads if num_heads else dim // head_dim
+        if self.num_heads == 0:
+            self.num_heads = 1
+        
+        self.attention_dim = self.num_heads * self.head_dim
+
+        self.v = nn.Linear(dim, self.attention_dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(self.attention_dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        
+    def forward(self, x):
+        B, H, W, C = x.shape
+        N = H * W
+
+        # Process only the 'value' part
+        v = self.v(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Since we are not using query and key, we can directly use the value
+        x = v.transpose(1, 2).reshape(B, H, W, self.attention_dim)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -632,7 +672,7 @@ class MetaFormer(nn.Module):
         else:
             self.head = head_fn(dims[-1], num_classes)
 
-        self.apply(self._init_weights)
+            self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -1536,3 +1576,72 @@ def caformer_b36_in21k(pretrained=False, **kwargs):
             url= model.default_cfg['url'], map_location="cpu", check_hash=True)
         model.load_state_dict(state_dict)
     return model
+
+@register_model
+def vformer_s18(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3],
+        dims=[64, 128, 320, 512],
+        token_mixers=Attention_v,
+        head_fn=MlpHead,
+        **kwargs)
+    model.default_cfg = default_cfgs['caformer_s18']
+    if pretrained:
+        state_dict = torch.hub.load_state_dict_from_url(
+            url= model.default_cfg['url'], map_location="cpu", check_hash=True)
+        model.load_state_dict(state_dict)
+    return model
+
+
+@register_model
+def aformer_s18(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3],
+        dims=[64, 128, 320, 512],
+        token_mixers=Attention_qkv,
+        head_fn=MlpHead,
+        **kwargs)
+    model.default_cfg = default_cfgs['caformer_s18']
+    if pretrained:
+        state_dict = torch.hub.load_state_dict_from_url(
+            url= model.default_cfg['url'], map_location="cpu", check_hash=True)
+        model.load_state_dict(state_dict)
+    return model
+
+
+@register_model
+def hformer_s18(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3],
+        dims=[64, 128, 320, 512],
+        token_mixers=[HardgroupAttention,HardgroupAttention,HardgroupAttention,Attention_qkv],
+        head_fn=MlpHead,
+        **kwargs)
+    model.default_cfg = default_cfgs['caformer_s18']
+    if pretrained:
+        state_dict = torch.hub.load_state_dict_from_url(
+            url= model.default_cfg['url'], map_location="cpu", check_hash=True)
+        model.load_state_dict(state_dict)
+    return model
+
+@register_model
+def csformer_s18_in21k(pretrained=False, **kwargs):
+    model = MetaFormer(
+        depths=[3, 3, 9, 3],
+        dims=[64, 128, 320, 512],
+        token_mixers=[SepConv, SepConv, SoftgroupAttention, Attention],
+        head_fn=MlpHead,
+        **kwargs)
+    model.default_cfg = default_cfgs['caformer_s18_in21k']
+    if pretrained:
+        state_dict = torch.hub.load_state_dict_from_url(
+            url= model.default_cfg['url'], map_location="cpu", check_hash=True)
+        model.load_state_dict(state_dict)
+    return model
+
+if __name__ == '__main__':
+    model = aformer_s18()
+    img = torch.randn(1, 3, 224, 224)
+    
+    preds = model(img)
+    print(preds.shape)  # (1, num_classes)
